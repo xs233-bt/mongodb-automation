@@ -1,0 +1,54 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime
+import pandas as pd
+import os
+import pendulum
+
+# 👉 reuse your existing function
+from device_orders_pipeline import send_email
+
+# ==============================
+# 📧 Email Task Function
+# ==============================
+def send_report_email(**context):
+
+    tz = "America/Los_Angeles"
+
+    now = pd.Timestamp.now(tz=tz)
+    report_date = now.normalize()
+
+    file_date = report_date.strftime("%Y-%m-%d")
+
+    file_path = f"/opt/airflow/output/device_orders_{file_date}.xlsx"
+
+    print(f"📂 Looking for file: {file_path}")
+
+    # ✅ Check file exists
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"❌ Report not found: {file_path}")
+
+    # ✅ Send email
+    send_email(file_path)
+
+    print("✅ Email sent successfully")
+
+
+# ==============================
+# 🟩 DAG Definition
+# ==============================
+local_tz = pendulum.timezone("America/Los_Angeles")
+
+with DAG(
+    dag_id="device_orders_email",
+    schedule="0 6 * * *",   # 👉 6AM PST
+    start_date=datetime(2026, 4, 9, tzinfo=local_tz),
+    catchup=False,
+    tags=["orders", "email", "mongodb"],
+) as dag:
+
+    send_email_task = PythonOperator(
+        task_id="send_device_orders_email",
+        python_callable=send_report_email,
+        provide_context=True
+    )
