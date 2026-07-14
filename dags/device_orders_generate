@@ -1,1 +1,802 @@
 
+from pymongo import MongoClient
+import pandas as pd
+from datetime import datetime
+import pytz
+from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import Alignment
+from airflow.models import Variable
+import os
+import smtplib
+from email.message import EmailMessage
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime
+import pendulum
+from azure_mongodb_lakehouse.bronze.mongodb_bronze_loader import write_bronze_parquet
+
+
+# ==============================
+# 🔌 1. Connect
+# ==============================
+def get_collection():
+    client = MongoClient(
+        "mongodb+srv://neo_lu:sZ2Q5ITVHWFueE2t@cluster0.rnc74hq.mongodb.net/"
+    )
+    return client["CRM"]["Orders"]
+
+
+# ==============================
+# ⚙️ 2. Pipeline
+# ==============================
+def build_pipeline():
+    return [
+        {"$unwind": "$items"},
+        {
+            "$match": {
+                "items.product.type.name": {
+                    "$in": ["VA Mobility Products", "Mobility Products"]
+                },
+                "items.product.name": {
+                    "$regex": "^(Model|Modo)",
+                    "$options": "i"
+                },
+                "stage.name": {"$nin": ["Quote", "Ready for Sending"]},
+            }
+        },
+        {
+            "$addFields": {
+                "order_date": {
+                    "$toDate": {"$multiply": ["$key_dates.submitted_on", 1000]}
+                }
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "Date": "$order_date",
+                "Order #": "$number",
+                "Status": "$stage.name",
+                "contact_id": "$contact_id",
+                "Product": "$items.product.name",
+                "Qty": "$items.quantity",
+                "Discount": "$items.discount.amount",
+                "Total": "$items.total",
+                "Ingest Date": {"$toDate": "$_id"},
+            }
+        },
+        {
+            "$lookup": {
+                "from": "ContactProfiles",
+                "localField": "contact_id",
+                "foreignField": "contact_id",
+                "as": "contact",
+            }
+        },
+        {"$unwind": {"path": "$contact", "preserveNullAndEmptyArrays": True}},
+        {
+            "$addFields": {
+                "Channel": {
+                    "$let": {
+                        "vars": {
+                            "match": {
+                                "$arrayElemAt": [
+                                    {
+                                        "$filter": {
+                                            "input": "$contact.custom_fields",
+                                            "as": "cf",
+                                            "cond": {
+                                                "$eq": ["$$cf.key", "whill_b2b_channel"]
+                                            },
+                                        }
+                                    },
+                                    0,
+                                ]
+                            }
+                        },
+                        "in": "$$match.value",
+                    }
+                },
+                "Assigned ISR": {
+                    "$let": {
+                        "vars": {
+                            "match": {
+                                "$arrayElemAt": [
+                                    {
+                                        "$filter": {
+                                            "input": "$contact.custom_fields",
+                                            "as": "cf",
+                                            "cond": {
+                                                "$eq": [
+                                                    "$$cf.key",
+                                                    "whill_b2b_isr_account",
+                                                ]
+                                            },
+                                        }
+                                    },
+                                    0,
+                                ]
+                            }
+                        },
+                        "in": {"$ifNull": ["$$match.value", "NO_ISR"]},
+                    }
+                },
+                "Sales Model": "$contact.sales_model.name",
+                "Customer Name": "$contact.profile.name",
+            }
+        },
+        {"$project": {"contact": 0, "contact_id": 0}},
+        {"$sort": {"Date": -1}},
+    ]
+
+
+def fetch_data(col):
+    return list(col.aggregate(build_pipeline()))
+
+
+# ==============================
+# 🧹 Clean
+# ==============================
+def clean_dataframe(data):
+    df = pd.DataFrame(data)
+
+    # Convert Decimal128 → float
+    for col in ["Qty", "Discount", "Total"]:
+        df[col] = df[col].apply(
+            lambda x: float(x.to_decimal()) if hasattr(x, "to_decimal") else x
+        )
+
+    df["Order #"] = df["Order #"].astype(int)
+    df["Qty"] = df["Qty"].astype(int)
+
+    df["Discount"] = df["Discount"].round(2)
+    df["Total"] = df["Total"].round(2)
+
+    df["Ingest Date"] = pd.Timestamp.now(tz="America/Los_Angeles")
+
+    return df
+
+
+# ==============================
+#  Build Summary
+# ==============================
+def build_summary_tables(df):
+
+    df = df[df["Status"] != "Cancelled"].copy()
+
+    tz = "America/Vancouver"
+    ingest_date = pd.Timestamp.now(tz=tz).normalize()
+
+    df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize("America/Vancouver")
+    df["Date_only"] = df["Date"].dt.normalize()
+
+    mtd_start = ingest_date.replace(day=1)
+    ytd_start = ingest_date.replace(month=1, day=1)
+
+    # ========= SUMMARY =========
+    def count(x):
+        return x["Qty"].sum()
+
+    df_summary = pd.DataFrame(
+        {
+            "Metric": ["Units"],
+            "Date": [count(df[df["Date_only"] == ingest_date])],
+            "MTD": [
+                count(
+                    df[
+                        (df["Date_only"] >= mtd_start)
+                        & (df["Date_only"] <= ingest_date)
+                    ]
+                )
+            ],
+            "YTD": [
+                count(
+                    df[
+                        (df["Date_only"] >= ytd_start)
+                        & (df["Date_only"] <= ingest_date)
+                    ]
+                )
+            ],
+        }
+    )
+
+    # ========= PRODUCT =========
+    def map_model(p):
+        p_clean = p.lower().replace(" ", "").replace("-", "")
+        
+        if "modo" in p_clean:
+            return "Modo"
+        if "c2" in p_clean:
+            return "Model C2"
+        elif "modelf" in p_clean or p_clean == "f":
+            return "Model F"
+        elif "r3" in p_clean:
+            return "Model R-3 wheel"
+        elif "r4" in p_clean:
+            return "Model R-4 wheel"
+        else:
+            return "Other"
+
+    df["Product Type"] = df["Product"].apply(map_model)
+
+    def agg(data):
+        return data.groupby(["Product Type", "Product"])["Qty"].sum().reset_index()
+
+    date_df = agg(df[df["Date_only"] == ingest_date]).rename(columns={"Qty": "Date"})
+    mtd_df = agg(
+        df[(df["Date_only"] >= mtd_start) & (df["Date_only"] <= ingest_date)]
+    ).rename(columns={"Qty": "MTD"})
+    ytd_df = agg(
+        df[(df["Date_only"] >= ytd_start) & (df["Date_only"] <= ingest_date)]
+    ).rename(columns={"Qty": "YTD"})
+
+    df_product = date_df.merge(mtd_df, on=["Product Type", "Product"], how="outer")
+    df_product = df_product.merge(ytd_df, on=["Product Type", "Product"], how="outer")
+    df_product = df_product.fillna(0)
+
+    return df_summary, df_product, ingest_date
+
+
+# ==============================
+#  Build Refund Summary
+# ==============================
+
+
+def build_refund_summary():
+
+    import pandas as pd
+    import os
+
+    path = "/opt/airflow/output/refund_history_tbl/refund_history.csv"
+
+    if not os.path.exists(path):
+        return pd.DataFrame()
+
+    df = pd.read_csv(path)
+
+    if df.empty:
+        return pd.DataFrame()
+
+    # ✅ use actual Date
+    df["refund_detected_date"] = pd.to_datetime(
+        df["refund_detected_date"], utc=True, format="mixed", errors="coerce"
+    )
+    df = df.dropna(subset=["refund_detected_date"])
+    df["refund_detected_date"] = df["refund_detected_date"].dt.tz_convert(
+        "America/Los_Angeles"
+    )
+    df["Date_only"] = df["refund_detected_date"].dt.normalize()
+
+    # ✅ make today same timezone
+    today = pd.Timestamp.now(tz="America/Los_Angeles").normalize()
+
+    mtd_start = today.replace(day=1)
+    ytd_start = today.replace(month=1, day=1)
+
+    # ---------- mapping ----------
+    def map_model(p):
+        p_clean = str(p).lower().replace(" ", "").replace("-", "")
+        if "modo" in p_clean:
+            return "Modo"
+        if "c2" in p_clean:
+            return "Model C2"
+        elif "modelf" in p_clean or p_clean == "f":
+            return "Model F"
+        elif "r3" in p_clean:
+            return "Model R-3 wheel"
+        elif "r4" in p_clean:
+            return "Model R-4 wheel"
+        else:
+            return "Other"
+
+    df["Product Type"] = df["product"].apply(map_model)
+
+    def agg(data):
+        return data.groupby(["Product Type", "product"])["qty"].sum().reset_index()
+
+    date_df = agg(df[df["Date_only"] == today]).rename(columns={"qty": "Date"})
+    mtd_df = agg(
+        df[(df["Date_only"] >= mtd_start) & (df["Date_only"] <= today)]
+    ).rename(columns={"qty": "MTD"})
+    ytd_df = agg(
+        df[(df["Date_only"] >= ytd_start) & (df["Date_only"] <= today)]
+    ).rename(columns={"qty": "YTD"})
+
+    df_summary = date_df.merge(mtd_df, on=["Product Type", "product"], how="outer")
+    df_summary = df_summary.merge(ytd_df, on=["Product Type", "product"], how="outer")
+
+    return df_summary.fillna(0)
+
+
+# ==============================
+#  Export
+# ==============================
+def export_to_excel(df):
+    bold_font = Font(bold=True)
+
+    def display_num(x):
+        x = int(x)
+        return "-" if x == 0 else x
+
+    now = pd.Timestamp.now(tz="America/Vancouver")
+
+    data_date = now.normalize()
+
+    # 👉 report name = next day
+    report_date = data_date + pd.Timedelta(days=1)
+
+    file_date = report_date.strftime("%Y-%m-%d")
+    output = f"/opt/airflow/output/device_orders_{file_date}.xlsx"
+
+    df_summary, df_product, ingest_date = build_summary_tables(df)
+
+    # remove timezone for Excel
+    df_export = df.copy()
+    for col in df_export.columns:
+        if pd.api.types.is_datetime64_any_dtype(df_export[col]):
+            df_export[col] = df_export[col].dt.tz_localize(None)
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+
+        df_summary.to_excel(writer, sheet_name="Order Summary", index=False)
+
+        ws_summary = writer.sheets["Order Summary"]
+
+        ws_summary["B1"] = ingest_date.strftime("%Y-%m-%d")
+
+        ws = writer.book.create_sheet("Order by Product")
+
+        # header
+        today = pd.Timestamp.now(tz="America/Los_Angeles").normalize()
+        tz = "America/Vancouver"
+        ingest_date = pd.Timestamp.now(tz=tz).normalize()
+        ingest_date = ingest_date.tz_localize(None)
+        bold_font = Font(bold=True)
+        ws["D2"] = ingest_date.strftime("%Y-%m-%d")
+        ws["E2"] = "MTD"
+        ws["F2"] = "YTD"
+        ws["D2"].font = bold_font
+        ws["E2"].font = bold_font
+        ws["F2"].font = bold_font
+
+        row = 4
+        ws[f"B{row}"] = "Orders by Product Type"
+        ws[f"B{row}"].font = bold_font
+        row += 2
+
+        # ==== helper ====
+        def clean_product_name(name):
+            name = name.replace("Model C2", "").strip()
+
+            # normalize dashes + spaces
+            name = name.replace("–", "-").replace("  ", " ").strip()
+
+            # remove leading dash/space
+            name = name.lstrip("- ").strip()
+
+            mapping = {
+                "16": "16 inch",
+                "18": "18 inch",
+                "20": "20 inch",
+                "18 HB": "18 inch HB",
+                "20 HB": "20 inch HB",
+                "2nd Factory Product Top 18": "Factory",
+            }
+
+            return mapping.get(name, name)
+
+        # ==== Model C2 ====
+        ws[f"B{row}"] = "Model C2"
+        ws[f"B{row}"].font = bold_font
+        row += 1
+
+        c2 = df_product[df_product["Product Type"] == "Model C2"]
+
+        for _, r in c2.iterrows():
+            ws[f"C{row}"] = clean_product_name(r["Product"])
+            ws[f"D{row}"] = "-" if int(r["Date"]) == 0 else int(r["Date"])
+            ws[f"E{row}"] = "-" if int(r["MTD"]) == 0 else int(r["MTD"])
+            ws[f"F{row}"] = "-" if int(r["YTD"]) == 0 else int(r["YTD"])
+            row += 1
+
+        # subtotal
+        ws[f"C{row}"] = "Subtotal"
+        ws[f"C{row}"].font = bold_font
+        ws[f"D{row}"] = display_num(c2["Date"].sum())
+        ws[f"E{row}"] = display_num(c2["MTD"].sum())
+        ws[f"F{row}"] = display_num(c2["YTD"].sum())
+        row += 2
+        
+        
+        # ==== Modo ====
+        # ==== Modo ====
+        modo = df_product[df_product["Product Type"] == "Modo"]
+
+        ws[f"B{row}"] = "Modo"
+        ws[f"B{row}"].font = bold_font
+        row += 1
+
+        for _, r in modo.iterrows():
+            ws[f"C{row}"] = r["Product"]
+            ws[f"D{row}"] = display_num(r["Date"])
+            ws[f"E{row}"] = display_num(r["MTD"])
+            ws[f"F{row}"] = display_num(r["YTD"])
+            row += 1
+
+        # subtotal
+        ws[f"C{row}"] = "Subtotal"
+        ws[f"C{row}"].font = bold_font
+        ws[f"D{row}"] = display_num(modo["Date"].sum())
+        ws[f"E{row}"] = display_num(modo["MTD"].sum())
+        ws[f"F{row}"] = display_num(modo["YTD"].sum())
+        row += 2
+
+        # ==== Model F ====
+        mf = df_product[df_product["Product Type"] == "Model F"]
+        ws[f"B{row}"] = "Model F"
+        ws[f"B{row}"].font = bold_font
+        ws[f"D{row}"] = display_num(mf["Date"].sum())
+        ws[f"E{row}"] = display_num(mf["MTD"].sum())
+        ws[f"F{row}"] = display_num(mf["YTD"].sum())
+        row += 2
+
+        # ==== R3 ====
+        r3 = df_product[
+            df_product["Product"].str.contains("R[ -]?3", case=False, regex=True)
+        ]
+        ws[f"B{row}"] = "Model R-3 wheel"
+        ws[f"B{row}"].font = bold_font
+        ws[f"D{row}"] = display_num(r3["Date"].sum())
+        ws[f"E{row}"] = display_num(r3["MTD"].sum())
+        ws[f"F{row}"] = display_num(r3["YTD"].sum())
+        row += 2
+
+        # ==== R4 ====
+        r4 = df_product[
+            df_product["Product"].str.contains("R[ -]?4", case=False, regex=True)
+        ]
+        ws[f"B{row}"] = "Model R-4 wheel"
+        ws[f"B{row}"].font = bold_font
+        ws[f"D{row}"] = display_num(r4["Date"].sum())
+        ws[f"E{row}"] = display_num(r4["MTD"].sum())
+        ws[f"F{row}"] = display_num(r4["YTD"].sum())
+        row += 2
+
+        # TOTAL
+        ws[f"C{row}"] = "TOTAL"
+        ws[f"C{row}"].font = bold_font
+        ws[f"D{row}"] = display_num(df_product["Date"].sum())
+        ws[f"E{row}"] = display_num(df_product["MTD"].sum())
+        ws[f"F{row}"] = display_num(df_product["YTD"].sum())
+
+        # =========================
+        # 🔴 Refund by Product
+        # =========================
+        refund_df = build_refund_summary()
+
+        ws_refund = writer.book.create_sheet("Refund by Product")
+
+        ws_refund["D2"] = ingest_date.strftime("%Y-%m-%d")
+        ws_refund["E2"] = "MTD"
+        ws_refund["F2"] = "YTD"
+        ws_refund["D2"].font = bold_font
+        ws_refund["E2"].font = bold_font
+        ws_refund["F2"].font = bold_font
+
+        ws_refund["B4"] = "Refund by Product Type"
+        ws_refund["B4"].font = bold_font
+
+        row = 6
+
+        # ==== Model C2 ====
+        ws_refund[f"B{row}"] = "Model C2"
+        ws_refund[f"B{row}"].font = bold_font
+        row += 1
+
+        c2 = refund_df[refund_df["Product Type"] == "Model C2"]
+
+        for _, r in c2.iterrows():
+            ws_refund[f"C{row}"] = clean_product_name(r["product"])
+            ws_refund[f"D{row}"] = display_num(r["Date"])
+            ws_refund[f"E{row}"] = display_num(r["MTD"])
+            ws_refund[f"F{row}"] = display_num(r["YTD"])
+            row += 1
+
+        # Subtotal
+        ws_refund[f"C{row}"] = "Subtotal"
+        ws_refund[f"C{row}"].font = bold_font
+        ws_refund[f"D{row}"] = display_num(c2["Date"].sum())
+        ws_refund[f"E{row}"] = display_num(c2["MTD"].sum())
+        ws_refund[f"F{row}"] = display_num(c2["YTD"].sum())
+
+        row += 2
+        
+        # ==== Modo ====
+        modo_refund = refund_df[refund_df["Product Type"] == "Modo"]
+
+        ws_refund[f"B{row}"] = "Modo"
+        ws_refund[f"B{row}"].font = bold_font
+        row += 1
+
+        for _, r in modo_refund.iterrows():
+            ws_refund[f"C{row}"] = r["product"]
+            ws_refund[f"D{row}"] = display_num(r["Date"])
+            ws_refund[f"E{row}"] = display_num(r["MTD"])
+            ws_refund[f"F{row}"] = display_num(r["YTD"])
+            row += 1
+
+        ws_refund[f"C{row}"] = "Subtotal"
+        ws_refund[f"C{row}"].font = bold_font
+        ws_refund[f"D{row}"] = display_num(modo_refund["Date"].sum())
+        ws_refund[f"E{row}"] = display_num(modo_refund["MTD"].sum())
+        ws_refund[f"F{row}"] = display_num(modo_refund["YTD"].sum())
+
+        row += 2
+
+        # ==== Other Models ====
+        for model in ["Model F", "Model R-3 wheel", "Model R-4 wheel"]:
+            subset = refund_df[refund_df["Product Type"] == model]
+
+            ws_refund[f"B{row}"] = model
+            ws_refund[f"B{row}"].font = bold_font
+            ws_refund[f"D{row}"] = display_num(subset["Date"].sum())
+            ws_refund[f"E{row}"] = display_num(subset["MTD"].sum())
+            ws_refund[f"F{row}"] = display_num(subset["YTD"].sum())
+            row += 2
+
+        # TOTAL
+        ws_refund[f"C{row}"] = "TOTAL"
+        ws_refund[f"C{row}"].font = bold_font
+        ws_refund[f"D{row}"] = display_num(refund_df["Date"].sum())
+        ws_refund[f"E{row}"] = display_num(refund_df["MTD"].sum())
+        ws_refund[f"F{row}"] = display_num(refund_df["YTD"].sum())
+        df_export.to_excel(writer, sheet_name="Source Data", index=False)
+
+        history_path = "/opt/airflow/output/refund_history_tbl/refund_history.csv"
+
+        if os.path.exists(history_path):
+
+            history_df = pd.read_csv(history_path)
+
+            history_df.to_excel(writer, sheet_name="Refund History", index=False)
+        # =========================
+        # Auto Fit Columns
+        # =========================
+        for sheet in writer.book.worksheets:
+
+            for column_cells in sheet.columns:
+
+                max_length = 0
+                column = column_cells[0].column
+
+                for cell in column_cells:
+                    try:
+                        if cell.value is not None:
+                            max_length = max(max_length, len(str(cell.value)))
+                    except:
+                        pass
+
+                adjusted_width = max_length + 2
+
+                sheet.column_dimensions[get_column_letter(column)].width = (
+                    adjusted_width
+                )
+        # =========================
+        # Center Align Numbers
+        # =========================
+        center_align = Alignment(horizontal="center")
+        for sheet in [ws, ws_refund]:
+
+            for row_cells in sheet.iter_rows(min_col=4, max_col=6):
+
+                for cell in row_cells:
+
+                    cell.alignment = center_align        
+
+    print("✅ Done:", output)
+    return output
+
+
+# ==============================
+# 🚀 Run
+# ==============================
+if __name__ == "__main__":
+    df = clean_dataframe(fetch_data(get_collection()))
+    export_to_excel(df)
+
+
+# ==============================
+# 🚀 MAIN PIPELINE
+# ==============================
+# def run_pipeline():
+#     col = get_collection()
+#     data = fetch_data(col)
+#     df = clean_dataframe(data)
+#     file_path = export_to_excel(df)
+#     send_email(file_path)
+
+
+def generate_report():
+    col = get_collection()
+    data = fetch_data(col)
+    df = clean_dataframe(data)
+
+    report_date = pd.Timestamp.now(tz="America/Los_Angeles").normalize().date()
+
+    write_bronze_parquet(df=df, report_date=report_date, source_name="device_orders")
+    file_path = export_to_excel(df)
+    return file_path
+
+
+# ==============================
+#  APPEND TO REFUND HISTORY TABLE
+# ==============================
+def append_to_refund_history(**context):
+    import pandas as pd
+    import os
+    from datetime import datetime, timedelta
+
+    path = "/opt/airflow/output"
+
+    files = [
+        f
+        for f in os.listdir(path)
+        if f.startswith("device_orders_") and f.endswith(".xlsx")
+    ]
+
+    def extract_date(f):
+        return datetime.strptime(f.split("_")[-1].replace(".xlsx", ""), "%Y-%m-%d")
+
+    files_sorted = sorted(files, key=extract_date)
+
+    if len(files_sorted) < 2:
+        print("Not enough files to compare")
+        return
+
+    today = datetime.today().date()
+    yesterday = today - timedelta(days=1)
+
+    today_file = f"device_orders_{today}.xlsx"
+    yesterday_file = f"device_orders_{yesterday}.xlsx"
+
+    if today_file in files and yesterday_file in files:
+        print("Using current_date logic")
+        f_curr = os.path.join(path, today_file)
+        f_prev = os.path.join(path, yesterday_file)
+    else:
+        print("Fallback to latest files")
+        f_curr = os.path.join(path, files_sorted[-1])
+        f_prev = os.path.join(path, files_sorted[-2])
+
+    df_prev = pd.read_excel(f_prev, sheet_name="Source Data")
+    df_curr = pd.read_excel(f_curr, sheet_name="Source Data")
+
+    df_prev = df_prev.rename(columns={"Status": "status_yesterday"})
+    df_curr = df_curr.rename(columns={"Status": "status_today"})
+
+    df_merge = df_curr.merge(
+        df_prev[["Order #", "status_yesterday"]], on="Order #", how="left"
+    )
+
+    df_refund = df_merge[
+        (df_merge["status_yesterday"].fillna("") != "Cancelled")
+        & (df_merge["status_today"] == "Cancelled")
+    ].copy()
+
+    report_sent_date = os.path.basename(f_curr).split("_")[-1].replace(".xlsx", "")
+
+    if df_refund.empty:
+        print(f"No refunds found for {report_sent_date}")
+        return
+
+    df_refund["status_change"] = (
+        df_refund["status_yesterday"].fillna("Blank")
+        + " => "
+        + df_refund["status_today"]
+    )
+
+    df_refund["report_sent_date"] = report_sent_date
+
+    df_refund = df_refund.rename(
+        columns={
+            "Date": "order_date",
+            "Order #": "order_number",
+            "Product": "product",
+            "Qty": "qty",
+            "Discount": "discount",
+            "Total": "total",
+            "Ingest Date": "refund_detected_date",
+            "Channel": "channel",
+            "Assigned ISR": "assigned_isr",
+            "Sales Model": "sales_model",
+            "Customer Name": "customer_name",
+        }
+    )
+
+    final_cols = [
+        "order_date",
+        "order_number",
+        "status_today",
+        "product",
+        "qty",
+        "discount",
+        "total",
+        "refund_detected_date",
+        "channel",
+        "assigned_isr",
+        "sales_model",
+        "customer_name",
+        "status_yesterday",
+        "status_change",
+        "report_sent_date",
+    ]
+
+    df_refund = df_refund[final_cols]
+
+    history_dir = os.path.join(path, "refund_history_tbl")
+    os.makedirs(history_dir, exist_ok=True)
+
+    history_file = os.path.join(history_dir, "refund_history.csv")
+
+    if os.path.exists(history_file):
+        df_history = pd.read_csv(history_file)
+
+        df_history = df_history.rename(
+            columns={
+                "Date": "order_date",
+                "Order #": "order_number",
+                "Status_today": "status_today",
+                "Product": "product",
+                "Qty": "qty",
+                "Discount": "discount",
+                "Total": "total",
+                "Ingest Date": "refund_detected_date",
+                "Channel": "channel",
+                "Assigned ISR": "assigned_isr",
+                "Sales Model": "sales_model",
+                "Customer Name": "customer_name",
+                "Status_yesterday": "status_yesterday",
+                "Report Date": "report_sent_date",
+            }
+        )
+
+        df_history = df_history.reindex(columns=final_cols)
+
+        df_all = pd.concat([df_history, df_refund], ignore_index=True)
+
+        df_all = df_all.drop_duplicates(
+            subset=["order_number", "report_sent_date"], keep="last"
+        )
+    else:
+        df_all = df_refund
+
+    df_all.to_csv(history_file, index=False)
+
+    print(f"Done - appended for {report_sent_date}")
+
+
+# ==============================
+# ▶️ LOCAL RUN
+# ==============================
+if __name__ == "__main__":
+    generate_report()
+
+local_tz = pendulum.timezone("America/Los_Angeles")
+with DAG(
+    dag_id="device_orders_generate",
+    schedule="59 23 * * *",
+    start_date=datetime(2025, 1, 1, tzinfo=local_tz),
+    catchup=False,
+    tags=["orders", "report", "mongodb", "generate"],
+) as dag:
+
+    run_report = PythonOperator(
+        task_id="run_device_orders_pipeline", python_callable=generate_report
+    )
+
+    append_refund = PythonOperator(
+        task_id="append_to_refund_history", python_callable=append_to_refund_history
+    )
+
+    run_report >> append_refund
