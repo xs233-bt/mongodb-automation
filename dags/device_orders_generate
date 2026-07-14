@@ -22,7 +22,7 @@ from azure_mongodb_lakehouse.bronze.mongodb_bronze_loader import write_bronze_pa
 # ==============================
 def get_collection():
     client = MongoClient(
-        "mongodb+srv://neo_lu:sZ2Q5ITVHWFueE2t@cluster0.rnc74hq.mongodb.net/"
+    "use your own credentials"
     )
     return client["CRM"]["Orders"]
 
